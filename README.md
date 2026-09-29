@@ -62,7 +62,33 @@ Change them with `--model` and `--effort`. Only the first 20,000 characters of
 a note and its attachments are sent (`--max-chars`); when content is cut off,
 the prompt tells Claude so.
 
-### 2. Register an app so the tool can write to OneNote (one time)
+### 2. Choose how pages get into OneNote
+
+| Target | Runs on | Setup | Notes |
+| --- | --- | --- | --- |
+| `--target com` | **Windows** with the OneNote desktop app (Microsoft 365 / OneNote 2016) | `pip install -e ".[com]"` | No Azure app, no sign-in, no size limits. Works offline. |
+| `--target graph` (default) | Any OS | Azure app registration + Microsoft sign-in (below) | 4 MB per-request limit; large files go to OneDrive. |
+
+#### Option A: OneNote desktop app (COM)
+
+```powershell
+pip install -e ".[com]"
+enex2onenote notebooks --target com          # checks that COM works and lists your notebooks
+```
+
+- **Notebook location.** If `--notebook` names a notebook that's already open
+  in OneNote, pages go there. If it isn't open, the tool creates a **local**
+  notebook in OneNote's default notebook folder (or in `--notebook-folder`).
+  To have a new notebook sync across devices, create it on OneDrive in
+  OneNote first (**File → New → OneDrive**), then pass its name.
+- **Attachments.** Files are embedded as file attachments. With PyMuPDF
+  installed (part of `.[com]`), each PDF's pages are also shown as images on
+  the page. The first 30 pages are shown; change this with
+  `--printout-max-pages`.
+- **Troubleshooting.** If COM fails to start, open OneNote once, then delete
+  `%LOCALAPPDATA%\Temp\gen_py` and try again.
+
+#### Option B: Microsoft Graph (register an app, one time)
 
 OneNote is updated through Microsoft Graph, which needs an app registration:
 
@@ -95,11 +121,13 @@ enex2onenote analyze "Household Bills.enex" --limit 10
 # Analyze everything, then edit migration-state/Household Bills/review.csv
 enex2onenote analyze "Household Bills.enex"
 
-# See the pages locally without uploading (HTML files in migration-state/.../preview)
+# See the pages locally without uploading (files in migration-state/.../preview;
+# add --target com to preview the OneNote XML instead of Graph's HTML)
 enex2onenote upload "Household Bills.enex" --dry-run
 
 # Upload to OneNote notebook "Evernote Import", section "Household Bills"
-enex2onenote upload "Household Bills.enex" --notebook "Evernote Import"
+enex2onenote upload "Household Bills.enex" --notebook "Evernote Import" --target com   # desktop app
+enex2onenote upload "Household Bills.enex" --notebook "Evernote Import"                # Graph
 
 # Or do both steps in one go, without the review step
 enex2onenote migrate "Recipes.enex" --notebook "Evernote Import" --section "Recipes"
@@ -119,14 +147,17 @@ Useful options:
 
 ## Limits and behavior
 
-- **Size limits.** Microsoft Graph caps each request at 4 MB and 5
+- **Notes whose analysis failed.** These notes are not uploaded under their
+  old Evernote title. Re-run `analyze`, or type a `final_title` for them in
+  `review.csv`.
+- **Size limits (Graph only).** Microsoft Graph caps each request at 4 MB and 5
   attachments, so the tool splits notes with many attachments into one create
   request and several follow-up updates. Attachments larger than about 3.4 MB
   can't go through the OneNote API. The tool uploads those to OneDrive under
   `Evernote Attachments/<notebook>/<section>/` and links them from the page.
 - **Tags.** OneNote has no free-form tags like Evernote. Tags become
   `#hashtags` in the page header, so OneNote search (`#taxes`) finds them.
-- **Full sections.** When a section reaches OneNote's page limit, the upload
+- **Full sections (Graph only).** When a section reaches OneNote's page limit, the upload
   continues in "Section (2)".
 - **Content that isn't migrated.** Encrypted Evernote text is replaced with a
   notice. Word or Excel attachments are uploaded but not read by Claude.

@@ -6,6 +6,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
+from html import escape
 from typing import Callable
 
 from bs4 import BeautifulSoup, Comment, Tag
@@ -122,6 +123,20 @@ def extract_for_analysis(note: Note, max_chars: int) -> ExtractedContent:
     full = "\n\n".join(sections)
     truncated = len(full) > max_chars
     return ExtractedContent(full[:max_chars] if truncated else full, truncated, scanned, images)
+
+
+def page_header_items(note: Note, title: str, tags: list[str]) -> list[str]:
+    """HTML snippets for the small metadata line at the top of each page."""
+    items = []
+    if tags:
+        items.append("Tags: " + " ".join(f"#{escape(t)}" for t in tags))
+    if note.title.strip() != title.strip():
+        items.append(f"Evernote title: {escape(note.title)}")
+    if note.created:
+        items.append(f"Created {note.created.date().isoformat()}")
+    if note.source_url:
+        items.append(f'<a href="{escape(note.source_url)}">Source</a>')
+    return items
 
 
 def _clean(tag: Tag) -> None:

@@ -120,7 +120,7 @@ def test_analyze_review_and_dry_run(sample_enex, tmp_path, monkeypatch, capsys):
     cli.main(base + ["analyze", str(sample_enex), "--workers", "2"])
     review_path = state_dir / "Household Bills" / "review.csv"
     rows = list(csv.DictReader(review_path.open(encoding="utf-8-sig")))
-    assert [r["final_title"] for r in rows] == ["AI Scan_0012.pdf", "Untitled", "AI Recipe & notes"]
+    assert [r["final_title"] for r in rows] == ["AI Scan_0012.pdf", "", "AI Recipe & notes"]
     assert rows[1]["ai_title"].startswith("ERROR")
 
     # Person edits the sheet: rename one note, skip another.
@@ -141,8 +141,18 @@ def test_analyze_review_and_dry_run(sample_enex, tmp_path, monkeypatch, capsys):
 
     cli.main(base + ["upload", str(sample_enex), "--dry-run"])
     previews = sorted((state_dir / "Household Bills" / "preview").glob("*.html"))
-    assert len(previews) == 2
+    assert len(previews) == 1
     assert "<title>My edited title</title>" in previews[0].read_text()
+    out = capsys.readouterr().out
+    assert "Previewed 1, skipped 1, failed 0, not analyzed 1" in out
+
+    # Typing a title for the failed note in the sheet makes it uploadable.
+    rows[1]["final_title"] = "Kitchen photo"
+    with review_path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
+    cli.main(base + ["upload", str(sample_enex), "--dry-run"])
     assert "Previewed 2, skipped 1" in capsys.readouterr().out
 
 

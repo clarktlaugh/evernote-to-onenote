@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import requests
 
-from .content import ONENOTE_IMAGE_TYPES, enml_to_html
+from .content import ONENOTE_IMAGE_TYPES, enml_to_html, page_header_items
 from .enex import Note, Resource
 
 log = logging.getLogger(__name__)
@@ -298,15 +298,7 @@ def plan_page(note: Note, title: str, tags: list[str], summary: str,
     if extra:
         body += f"<div><p><b>Attachments</b></p>{extra}</div>"
 
-    meta = []
-    if tags:
-        meta.append("Tags: " + " ".join(f"#{escape(t)}" for t in tags))
-    if note.title.strip() != title.strip():
-        meta.append(f"Evernote title: {escape(note.title)}")
-    if note.created:
-        meta.append(f"Created {note.created.date().isoformat()}")
-    if note.source_url:
-        meta.append(f'<a href="{escape(note.source_url)}">Source</a>')
+    meta = page_header_items(note, title, tags)
     header = ""
     if meta:
         header += f'<p style="color:#595959;font-size:9pt">{" &#183; ".join(meta)}</p>'

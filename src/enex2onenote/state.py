@@ -73,7 +73,9 @@ class NotebookState:
                 "note_id": rec["note_id"],
                 "index": rec.get("index", ""),
                 "skip": "",
-                "final_title": a.get("title", rec.get("original_title", "")),
+                # Left blank when analysis failed: the note isn't uploaded until it
+                # is analyzed or the person types a title here themselves.
+                "final_title": a.get("title", ""),
                 "final_tags": "; ".join(a.get("tags", [])),
                 "ai_title": a.get("title", "") if a else f"ERROR: {rec.get('error', '')}",
                 "original_title": rec.get("original_title", ""),

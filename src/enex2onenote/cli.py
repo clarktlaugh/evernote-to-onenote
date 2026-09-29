@@ -129,9 +129,9 @@ def _final_metadata(note: Note, state: NotebookState, review: dict, keep_good: b
     rec = state.analyses.get(note.id)
     a = (rec or {}).get("analysis")
     row = review.get(note.id)
-    if row:
+    if row and (a or row.get("final_title", "").strip()):
         skip = row.get("skip", "").strip().lower() in ("y", "yes", "x", "1", "true", "skip")
-        title = row.get("final_title", "").strip() or note.title
+        title = row.get("final_title", "").strip() or (a or {}).get("title") or note.title
         tags = [t.strip() for t in row.get("final_tags", "").split(";") if t.strip()]
         return title, tags, row.get("summary", ""), skip
     if not a:
@@ -140,8 +140,125 @@ def _final_metadata(note: Note, state: NotebookState, review: dict, keep_good: b
     return title, a.get("tags", []), a.get("summary", ""), False
 
 
+class UploadError(Exception):
+    pass
+
+
+class GraphUploader:
+    """Uploads through Microsoft Graph (any OS; needs an Azure app registration)."""
+
+    def __init__(self, args, section_name: str):
+        from .onenote import safe_name
+
+        self.args = args
+        self.section_name = section_name
+        self.section_suffix = 1
+        self.onedrive_folder = (f"Evernote Attachments/{safe_name(args.notebook, 100)}/"
+                                f"{safe_name(section_name, 100)}")
+        self.graph = self.section = None
+
+    def _plan(self, note, title, tags, summary):
+        from .onenote import plan_page
+
+        return plan_page(note, title, tags, summary, pdf_printouts=not self.args.no_pdf_printouts,
+                         include_summary=not self.args.no_summary)
+
+    def connect(self) -> None:
+        self.graph = _graph(self.args)
+        notebook = self.graph.ensure_notebook(self.args.notebook)
+        self.notebook_id = notebook["id"]
+        self.section = self.graph.ensure_section(self.notebook_id, self.section_name)
+        _say(f"Uploading via Microsoft Graph to notebook {notebook['displayName']!r}, "
+             f"section {self.section['displayName']!r}")
+
+    def preview(self, note, title, tags, summary, out_base: Path) -> str:
+        plan = self._plan(note, title, tags, summary)
+        Path(f"{out_base}.html").write_text(plan.html, encoding="utf-8")
+        extra = sum(len(p) for _, p in plan.patches)
+        return (f"{len(plan.first_parts)} inline + {extra} follow-up attachment(s), "
+                f"{len(plan.onedrive)} to OneDrive")
+
+    def upload(self, note, title, tags, summary) -> dict:
+        from .onenote import GraphError, upload_page
+
+        plan = self._plan(note, title, tags, summary)
+        try:
+            try:
+                page = upload_page(self.graph, self.section["id"], plan, self.onedrive_folder)
+            except GraphError as e:
+                if e.status != 507:
+                    raise
+                # Section reached OneNote's page limit: continue in a new section.
+                self.section_suffix += 1
+                self.section = self.graph.ensure_section(
+                    self.notebook_id, f"{self.section_name[:44]} ({self.section_suffix})")
+                _say(f"Section full; continuing in {self.section['displayName']!r}")
+                page = upload_page(self.graph, self.section["id"], plan, self.onedrive_folder)
+        except GraphError as e:
+            raise UploadError(str(e)) from e
+        return {"page_id": page.get("id"),
+                "url": (page.get("links") or {}).get("oneNoteWebUrl", {}).get("href"),
+                "section": self.section["displayName"]}
+
+
+class ComUploader:
+    """Drives the OneNote desktop app through COM (Windows only)."""
+
+    def __init__(self, args, section_name: str):
+        self.args = args
+        self.section_name = section_name
+        self.onenote = self.section = None
+
+    def _xml(self, note, title, tags, summary, page_id: str, attach_dir: Path) -> str:
+        from .onenote_com import build_page_xml
+
+        return build_page_xml(note, page_id, title, tags, summary, attach_dir,
+                              pdf_printouts=not self.args.no_pdf_printouts,
+                              include_summary=not self.args.no_summary,
+                              printout_max_pages=self.args.printout_max_pages)
+
+    def connect(self) -> None:
+        from .onenote import safe_name
+        from .onenote_com import OneNoteCom
+
+        self.onenote = OneNoteCom()
+        notebook, created = self.onenote.ensure_notebook(safe_name(self.args.notebook, 128),
+                                                         self.args.notebook_folder)
+        if created:
+            _say(f"Created a new notebook at {notebook['path']}.\n"
+                 "  Note: notebooks created this way are stored locally. To have it sync to "
+                 "OneDrive, create the notebook in OneNote on OneDrive first (File > New), "
+                 "or later use File > Share > Move Notebook.")
+        self.section = self.onenote.ensure_section(notebook["id"], safe_name(self.section_name))
+        _say(f"Uploading via the OneNote app (COM) to notebook {notebook['name']!r}, "
+             f"section {self.section['name']!r}")
+
+    def preview(self, note, title, tags, summary, out_base: Path) -> str:
+        attach_dir = Path(f"{out_base}-files")
+        attach_dir.mkdir(exist_ok=True)
+        xml = self._xml(note, title, tags, summary, "{preview-page-id}", attach_dir)
+        Path(f"{out_base}.xml").write_text(xml, encoding="utf-8")
+        files = len(list(attach_dir.iterdir()))
+        if not files:
+            attach_dir.rmdir()
+        return f"{files} attached file(s)"
+
+    def upload(self, note, title, tags, summary) -> dict:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="enex2onenote-") as tmp:
+            try:
+                page_id = self.onenote.create_page(
+                    self.section["id"],
+                    lambda pid: self._xml(note, title, tags, summary, pid, Path(tmp)))
+            except Exception as e:  # pywintypes.com_error carries the HRESULT
+                raise UploadError(f"OneNote COM error: {e}") from e
+        return {"page_id": page_id, "url": self.onenote.link(page_id),
+                "section": self.section["name"]}
+
+
 def run_upload(args) -> None:
-    from .onenote import GraphError, plan_page, safe_name, upload_page
+    from .onenote import safe_name
 
     enex = Path(args.enex)
     state = NotebookState(Path(args.state_dir), enex)
@@ -150,18 +267,12 @@ def run_upload(args) -> None:
     total = count_notes(enex)
     limit = args.limit or total
 
-    graph = section = None
+    uploader = (ComUploader if args.target == "com" else GraphUploader)(args, section_name)
     if args.dry_run:
         state.preview_dir.mkdir(exist_ok=True)
-        _say(f"Dry run: writing page previews to {state.preview_dir}")
+        _say(f"Dry run ({args.target}): writing page previews to {state.preview_dir}")
     else:
-        graph = _graph(args)
-        notebook = graph.ensure_notebook(args.notebook)
-        section = graph.ensure_section(notebook["id"], section_name)
-        _say(f"Uploading to OneNote notebook {notebook['displayName']!r}, "
-             f"section {section['displayName']!r}")
-    section_suffix = 1
-    onedrive_folder = f"Evernote Attachments/{safe_name(args.notebook, 100)}/{safe_name(section_name, 100)}"
+        uploader.connect()
 
     uploaded = skipped = failed = missing = 0
     for note in iter_notes(enex):
@@ -173,45 +284,28 @@ def run_upload(args) -> None:
         meta = _final_metadata(note, state, review, args.keep_good_titles)
         if meta is None:
             missing += 1
-            _say(f"{prefix} {_short(note.title)!r} not analyzed yet - skipping")
+            _say(f"{prefix} {_short(note.title)!r} has no AI title yet - skipping "
+                 "(re-run analyze, or type a final_title in review.csv)")
             continue
         title, tags, summary, skip = meta
         if skip:
             skipped += 1
             continue
-        plan = plan_page(note, title, tags, summary, pdf_printouts=not args.no_pdf_printouts,
-                         include_summary=not args.no_summary)
         if args.dry_run:
-            out = state.preview_dir / f"{note.index + 1:05d}-{safe_name(title, 60)}.html"
-            out.write_text(plan.html, encoding="utf-8")
-            extra = sum(len(p) for _, p in plan.patches)
-            _say(f"{prefix} {title!r}: {len(plan.first_parts)} inline + {extra} follow-up "
-                 f"attachment(s), {len(plan.onedrive)} to OneDrive")
+            out_base = state.preview_dir / f"{note.index + 1:05d}-{safe_name(title, 60)}"
+            _say(f"{prefix} {title!r}: {uploader.preview(note, title, tags, summary, out_base)}")
             uploaded += 1
             continue
         try:
-            try:
-                page = upload_page(graph, section["id"], plan, onedrive_folder)
-            except GraphError as e:
-                if e.status != 507:
-                    raise
-                # Section reached OneNote's page limit: continue in a new section.
-                section_suffix += 1
-                section = graph.ensure_section(
-                    graph.ensure_notebook(args.notebook)["id"],
-                    f"{section_name[:44]} ({section_suffix})")
-                _say(f"Section full; continuing in {section['displayName']!r}")
-                page = upload_page(graph, section["id"], plan, onedrive_folder)
-        except GraphError as e:
+            info = uploader.upload(note, title, tags, summary)
+        except UploadError as e:
             failed += 1
             state.record_upload({"note_id": note.id, "status": "error", "error": str(e)})
             _say(f"{prefix} {title!r} FAILED: {e}")
             continue
         uploaded += 1
         state.record_upload({
-            "note_id": note.id, "status": "ok", "title": title, "page_id": page.get("id"),
-            "url": (page.get("links") or {}).get("oneNoteWebUrl", {}).get("href"),
-            "section": section["displayName"],
+            "note_id": note.id, "status": "ok", "title": title, "target": args.target, **info,
             "uploaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         _say(f"{prefix} uploaded {title!r}")
 
@@ -248,6 +342,9 @@ def _add_ai_args(p):
 
 def _add_upload_args(p):
     g = p.add_argument_group("OneNote upload")
+    g.add_argument("--target", choices=["graph", "com"], default="graph",
+                   help="graph = Microsoft Graph web API (any OS, needs an Azure app "
+                        "registration); com = drive the OneNote desktop app (Windows only)")
     g.add_argument("--notebook", default=DEFAULT_NOTEBOOK,
                    help=f"OneNote notebook (created if missing; default {DEFAULT_NOTEBOOK!r})")
     g.add_argument("--section", help="OneNote section (default: the .enex file name)")
@@ -260,6 +357,11 @@ def _add_upload_args(p):
     g.add_argument("--no-pdf-printouts", action="store_true",
                    help="Attach PDFs only; don't render their pages as images on the page")
     g.add_argument("--no-summary", action="store_true", help="Don't add the AI summary line")
+    g.add_argument("--notebook-folder",
+                   help="com only: folder for a new notebook if --notebook doesn't exist yet "
+                        "(default: OneNote's default notebook location)")
+    g.add_argument("--printout-max-pages", type=int, default=30,
+                   help="com only: PDF pages rendered as images per attachment")
 
 
 def _add_ms_args(p):
@@ -283,6 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ms_args(p)
 
     p = sub.add_parser("notebooks", help="List your OneNote notebooks")
+    p.add_argument("--target", choices=["graph", "com"], default="graph")
     _add_ms_args(p)
 
     p = sub.add_parser("analyze", help="Step 1: generate titles/tags and write review.csv")
@@ -316,14 +419,20 @@ def main(argv: list[str] | None = None) -> int:
         graph = _graph(args)
         _say(f"Signed in as {graph.auth.account_name()}")
     elif args.command == "notebooks":
-        for nb in _graph(args).list_notebooks():
-            _say(nb["displayName"])
+        if args.target == "com":
+            from .onenote_com import OneNoteCom
+
+            for nb in OneNoteCom().notebooks():
+                _say(f"{nb['name']}  ({nb['path']})")
+        else:
+            for nb in _graph(args).list_notebooks():
+                _say(nb["displayName"])
     elif args.command == "analyze":
         run_analyze(args)
     elif args.command == "upload":
         run_upload(args)
     elif args.command == "migrate":
-        if not args.dry_run:
+        if not args.dry_run and args.target == "graph":
             _graph(args)  # sign in up front, before spending time on analysis
         run_analyze(args)
         args.ignore_review = False

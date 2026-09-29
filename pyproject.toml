@@ -18,6 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Upload through the OneNote desktop app instead of Microsoft Graph (Windows only)
+com = ["pywin32>=306; sys_platform == 'win32'", "pymupdf>=1.24"]
 dev = ["pytest>=8"]
 
 [project.scripts]
