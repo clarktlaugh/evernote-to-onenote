@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+# Your notes: keep exports and migration progress out of git
+migration-state/
+*.enex
