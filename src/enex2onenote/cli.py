@@ -10,7 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__
+from . import __version__, layout
 from .ai import AnalysisError, make_analyzer
 from .enex import Note, count_notes, iter_notes
 from .state import NotebookState, tag_vocabulary
@@ -33,7 +33,7 @@ def _short(s: str, n: int = 45) -> str:
 # analyze
 # --------------------------------------------------------------------------
 
-def run_analyze(args) -> NotebookState:
+def run_analyze(args) -> dict[str, int]:
     enex = Path(args.enex)
     state = NotebookState(Path(args.state_dir), enex)
     instructions = args.instructions
@@ -104,7 +104,7 @@ def run_analyze(args) -> NotebookState:
     _say(f"Review and edit titles/tags (or mark skip=y) in:\n  {state.review_path}")
     if failed:
         _say("Re-run the same command to retry failed notes.")
-    return state
+    return {"analyzed": done, "analysis failed": failed}
 
 
 # --------------------------------------------------------------------------
@@ -182,23 +182,63 @@ class GraphUploader:
         from .onenote import GraphError, upload_page
 
         plan = self._plan(note, title, tags, summary)
-        try:
+        while True:
             try:
                 page = upload_page(self.graph, self.section["id"], plan, self.onedrive_folder)
+                break
             except GraphError as e:
-                if e.status != 507:
-                    raise
-                # Section reached OneNote's page limit: continue in a new section.
+                if e.status != 507 or self.section_suffix >= 100:
+                    raise UploadError(str(e)) from e
+                # Section reached OneNote's page limit: continue in the next one. When
+                # several exports share a section, "(2)" may already be full as well.
                 self.section_suffix += 1
-                self.section = self.graph.ensure_section(
-                    self.notebook_id, f"{self.section_name[:44]} ({self.section_suffix})")
+                try:
+                    self.section = self.graph.ensure_section(
+                        self.notebook_id, f"{self.section_name[:44]} ({self.section_suffix})")
+                except GraphError as e2:
+                    raise UploadError(str(e2)) from e2
                 _say(f"Section full; continuing in {self.section['displayName']!r}")
-                page = upload_page(self.graph, self.section["id"], plan, self.onedrive_folder)
-        except GraphError as e:
-            raise UploadError(str(e)) from e
         return {"page_id": page.get("id"),
                 "url": (page.get("links") or {}).get("oneNoteWebUrl", {}).get("href"),
                 "section": self.section["displayName"]}
+
+
+def _com_notebook(args):
+    """Connect to OneNote and find --notebook, which must already be open there."""
+    from .onenote_com import OneNoteCom
+
+    onenote = OneNoteCom()
+    notebook = onenote.find_notebook(args.notebook)
+    if notebook is None:
+        _missing_notebooks(onenote, [args.notebook])
+    return onenote, notebook
+
+
+def _missing_notebooks(onenote, missing: list[str]) -> None:
+    names = "\n".join(f"  {nb['name']}" for nb in onenote.notebooks()) or "  (none)"
+    wanted = "\n".join(f"  {n}" for n in missing)
+    raise SystemExit(
+        f"OneNote has no open notebook named:\n{wanted}\n"
+        "Create each one in OneNote first with File > New > OneDrive, so that OneNote "
+        "syncs it to OneDrive itself. Use exactly these names (for a folder of exports, "
+        "the notebook folder names), then run this again.\n"
+        f"Notebooks open in OneNote:\n{names}")
+
+
+def _preflight(args, jobs: list[layout.Job]) -> None:
+    """Check the upload target before any work, so a long run can't fail partway."""
+    if args.dry_run:
+        return
+    if args.target == "graph":
+        _graph(args)  # sign in; Graph creates missing notebooks itself
+        return
+    from .onenote_com import OneNoteCom
+
+    onenote = OneNoteCom()
+    missing = [n for n in layout.notebooks(jobs) or [args.notebook]
+               if onenote.find_notebook(n) is None]
+    if missing:
+        _missing_notebooks(onenote, missing)
 
 
 class ComUploader:
@@ -219,16 +259,8 @@ class ComUploader:
 
     def connect(self) -> None:
         from .onenote import safe_name
-        from .onenote_com import OneNoteCom
 
-        self.onenote = OneNoteCom()
-        notebook, created = self.onenote.ensure_notebook(safe_name(self.args.notebook, 128),
-                                                         self.args.notebook_folder)
-        if created:
-            _say(f"Created a new notebook at {notebook['path']}.\n"
-                 "  Note: notebooks created this way are stored locally. To have it sync to "
-                 "OneDrive, create the notebook in OneNote on OneDrive first (File > New), "
-                 "or later use File > Share > Move Notebook.")
+        self.onenote, notebook = _com_notebook(self.args)
         self.section = self.onenote.ensure_section(notebook["id"], safe_name(self.section_name))
         _say(f"Uploading via the OneNote app (COM) to notebook {notebook['name']!r}, "
              f"section {self.section['name']!r}")
@@ -257,7 +289,7 @@ class ComUploader:
                 "section": self.section["name"]}
 
 
-def run_upload(args) -> None:
+def run_upload(args) -> dict[str, int]:
     from .onenote import safe_name
 
     enex = Path(args.enex)
@@ -315,6 +347,8 @@ def run_upload(args) -> None:
         _say("Re-run the same command to retry failed notes; uploaded notes are not duplicated.")
     if missing:
         _say("Run `enex2onenote analyze` first for notes that were not analyzed.")
+    return {verb.lower(): uploaded, "skipped": skipped, "upload failed": failed,
+            "not analyzed": missing}
 
 
 # --------------------------------------------------------------------------
@@ -342,14 +376,20 @@ def _add_ai_args(p):
 
 def _add_upload_args(p):
     g = p.add_argument_group("OneNote upload")
-    g.add_argument("--target", choices=["graph", "com"], default="graph",
-                   help="graph = Microsoft Graph web API (any OS, needs an Azure app "
-                        "registration); com = drive the OneNote desktop app (Windows only)")
-    g.add_argument("--notebook", default=DEFAULT_NOTEBOOK,
-                   help=f"OneNote notebook (created if missing; default {DEFAULT_NOTEBOOK!r})")
-    g.add_argument("--section", help="OneNote section (default: the .enex file name)")
+    g.add_argument("--target", choices=["com", "graph"], default="com",
+                   help="com (default) = drive the OneNote desktop app (Windows only); "
+                        "graph = Microsoft Graph web API (any OS, needs an Azure app "
+                        "registration)")
+    g.add_argument("--notebook",
+                   help="OneNote notebook for a single .enex file. com: must already be open "
+                        "in OneNote (create it with File > New > OneDrive); graph: created if "
+                        f"missing (default {DEFAULT_NOTEBOOK!r}). For a folder, the notebook "
+                        "folder names are used instead.")
+    g.add_argument("--section", help="OneNote section for a single .enex file (default: the "
+                                     "file name)")
     g.add_argument("--dry-run", action="store_true",
-                   help="Write HTML previews locally instead of uploading")
+                   help="Write page previews locally instead of uploading (OneNote XML for "
+                        "com, HTML for graph)")
     g.add_argument("--ignore-review", action="store_true",
                    help="Ignore review.csv edits and use the AI results directly")
     g.add_argument("--keep-good-titles", action="store_true",
@@ -357,9 +397,6 @@ def _add_upload_args(p):
     g.add_argument("--no-pdf-printouts", action="store_true",
                    help="Attach PDFs only; don't render their pages as images on the page")
     g.add_argument("--no-summary", action="store_true", help="Don't add the AI summary line")
-    g.add_argument("--notebook-folder",
-                   help="com only: folder for a new notebook if --notebook doesn't exist yet "
-                        "(default: OneNote's default notebook location)")
     g.add_argument("--printout-max-pages", type=int, default=30,
                    help="com only: PDF pages rendered as images per attachment")
 
@@ -385,23 +422,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ms_args(p)
 
     p = sub.add_parser("notebooks", help="List your OneNote notebooks")
-    p.add_argument("--target", choices=["graph", "com"], default="graph")
+    p.add_argument("--target", choices=["com", "graph"], default="com")
     _add_ms_args(p)
 
+    def add_source(p):
+        p.add_argument("enex", metavar="PATH",
+                       help="An .enex file, or a folder of notebook folders "
+                            "(<folder>/<Notebook>/<Section>.enex), or one notebook folder")
+        p.add_argument("--limit", type=int,
+                       help="Only process the first N notes of each .enex file (for trying it out)")
+
     p = sub.add_parser("analyze", help="Step 1: generate titles/tags and write review.csv")
-    p.add_argument("enex")
-    p.add_argument("--limit", type=int, help="Only process the first N notes (for trying it out)")
+    add_source(p)
     _add_ai_args(p)
 
     p = sub.add_parser("upload", help="Step 2: create OneNote pages from the reviewed results")
-    p.add_argument("enex")
-    p.add_argument("--limit", type=int, help="Only process the first N notes")
+    add_source(p)
     _add_upload_args(p)
     _add_ms_args(p)
 
     p = sub.add_parser("migrate", help="Analyze and upload in one go (no review step)")
-    p.add_argument("enex")
-    p.add_argument("--limit", type=int, help="Only process the first N notes")
+    add_source(p)
     _add_ai_args(p)
     _add_upload_args(p)
     _add_ms_args(p)
@@ -410,12 +451,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Titles can hold any character. When output goes to a file or pipe, Windows
+        # would otherwise encode it with cp1252 and crash on the first unusual one.
+        if hasattr(stream, "reconfigure") and not stream.isatty():
+            stream.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
-    if getattr(args, "enex", None) and not Path(args.enex).is_file():
-        raise SystemExit(f"File not found: {args.enex}")
+    if not args.verbose:
+        # pypdf warns about every quirk of a damaged PDF ("Ignoring wrong pointing
+        # object ...") while still extracting its text. Show those only with -v.
+        logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-    if args.command == "login":
+    if args.command in ("analyze", "upload", "migrate"):
+        run_jobs(args, layout.plan(Path(args.enex)))
+    elif args.command == "login":
         graph = _graph(args)
         _say(f"Signed in as {graph.auth.account_name()}")
     elif args.command == "notebooks":
@@ -427,17 +477,49 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for nb in _graph(args).list_notebooks():
                 _say(nb["displayName"])
-    elif args.command == "analyze":
-        run_analyze(args)
-    elif args.command == "upload":
-        run_upload(args)
-    elif args.command == "migrate":
-        if not args.dry_run and args.target == "graph":
-            _graph(args)  # sign in up front, before spending time on analysis
-        run_analyze(args)
-        args.ignore_review = False
-        run_upload(args)
     return 0
+
+
+def run_jobs(args, jobs: list[layout.Job]) -> None:
+    """Run analyze/upload/migrate for one .enex file, or for each file in a folder."""
+    analyze = args.command in ("analyze", "migrate")
+    upload = args.command in ("upload", "migrate")
+    folder = jobs[0].notebook is not None
+    if upload:
+        if folder and (args.notebook or args.section):
+            raise SystemExit("--notebook and --section apply to a single .enex file. For a "
+                             "folder, notebooks are named after the notebook folders and "
+                             "sections after the .enex files.")
+        args.notebook = args.notebook or DEFAULT_NOTEBOOK
+    if folder:
+        names = layout.notebooks(jobs)
+        _say(f"{len(jobs)} export(s) in {len(names)} notebook(s):")
+        for name in names:
+            sections = [j.section for j in jobs if j.notebook == name]
+            _say(f"  {name}: " + ", ".join(sections))
+    if upload:
+        _preflight(args, jobs)  # before analysis, which can take hours
+
+    totals: dict[str, int] = {}
+    for i, job in enumerate(jobs, start=1):
+        job_args = argparse.Namespace(**vars(args))
+        job_args.enex = str(job.enex)
+        if folder:
+            job_args.notebook, job_args.section = job.notebook, job.section
+            _say(f"\n=== {job.label} ({i} of {len(jobs)}) ===")
+        counts = {}
+        if analyze:
+            counts.update(run_analyze(job_args))
+        if upload:
+            if args.command == "migrate":
+                job_args.ignore_review = False
+            counts.update(run_upload(job_args))
+        for k, v in counts.items():
+            totals[k] = totals.get(k, 0) + v
+
+    if folder:
+        _say(f"\nAll {len(jobs)} exports: "
+             + ", ".join(f"{k} {v}" for k, v in totals.items()) + ".")
 
 
 if __name__ == "__main__":

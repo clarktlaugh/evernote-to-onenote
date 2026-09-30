@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import threading
 from collections import Counter
 from pathlib import Path
@@ -25,13 +26,21 @@ def _read_jsonl(path: Path) -> dict[str, dict]:
     return records
 
 
+def state_dir_for(root: Path, enex_path: Path) -> Path:
+    """<root>/<folder>/<file name>: exports with the same name in different folders
+    (one folder per OneNote notebook) must not share progress or review sheets."""
+    enex_path = Path(enex_path).resolve()
+    return root / enex_path.parent.name / enex_path.stem
+
+
 class NotebookState:
     """Per-.enex working directory: analysis cache, review sheet, upload log."""
 
     def __init__(self, root: Path, enex_path: Path):
         self.root = root
-        self.dir = root / enex_path.stem
+        self.dir = state_dir_for(root, enex_path)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._claim(Path(enex_path).resolve())
         self.analysis_path = self.dir / "analysis.jsonl"
         self.uploads_path = self.dir / "uploads.jsonl"
         self.review_path = self.dir / "review.csv"
@@ -39,6 +48,24 @@ class NotebookState:
         self._lock = threading.Lock()
         self.analyses = _read_jsonl(self.analysis_path)
         self.uploads = _read_jsonl(self.uploads_path)
+
+    def _claim(self, enex_path: Path) -> None:
+        """Record which export this directory belongs to, and refuse a different one.
+
+        Two folders with the same name in different places would otherwise map to
+        the same directory. A moved or renamed export takes the directory over,
+        since the file it was recorded for no longer exists.
+        """
+        source = self.dir / "source.txt"
+        if source.exists():
+            previous = Path(source.read_text(encoding="utf-8").strip())
+            if (os.path.normcase(str(previous)) != os.path.normcase(str(enex_path))
+                    and previous.is_file()):
+                raise SystemExit(
+                    f"{self.dir} already holds the progress for\n  {previous}\n"
+                    f"so it can't also be used for\n  {enex_path}\n"
+                    "Rename one of the two folders or files, or pass a different --state-dir.")
+        source.write_text(str(enex_path) + "\n", encoding="utf-8")
 
     def _append(self, path: Path, rec: dict) -> None:
         with self._lock, path.open("a", encoding="utf-8") as f:
@@ -102,7 +129,7 @@ class NotebookState:
 def tag_vocabulary(root: Path, limit: int = 250) -> list[str]:
     """Most-used tags across every notebook processed so far, for consistency."""
     counts: Counter[str] = Counter()
-    for path in root.glob("*/analysis.jsonl"):
+    for path in root.glob("**/analysis.jsonl"):
         for rec in _read_jsonl(path).values():
             counts.update((rec.get("analysis") or {}).get("tags", []))
         review = path.parent / "review.csv"

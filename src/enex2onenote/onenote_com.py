@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 import re
 import struct
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
 from typing import Callable
@@ -38,7 +38,9 @@ HS_NOTEBOOKS = 2
 HS_SECTIONS = 3
 CFT_NOTEBOOK = 1
 CFT_SECTION = 3
-SL_DEFAULT_NOTEBOOK_FOLDER = 2
+# Microsoft OneNote 15.0 Type Library (OneNote 2013 and later): GUID, LCID, major, minor
+ONENOTE_TYPELIB = ("{0EA692EE-BB50-4E3C-AEF0-356D91732725}", 0, 1, 1)
+TYPE_E_LIBNOTREGISTERED = -2147319779
 
 # Image types OneNote can embed directly from <one:Data>.
 COM_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp"}
@@ -368,22 +370,72 @@ def build_page_xml(note: Note, page_id: str, title: str, tags: list[str], summar
 
 def _dispatch():
     try:
+        import pywintypes
         import win32com.client
     except ImportError:
-        raise SystemExit("--target com needs Windows, the OneNote desktop app and pywin32:\n"
-                         "  pip install pywin32 pymupdf")
-    last = None
+        if sys.platform != "win32":
+            raise SystemExit("Uploading through the OneNote desktop app (--target com, the "
+                             "default) needs Windows. On other systems use --target graph; "
+                             "see README.md for its one-time setup.")
+        raise SystemExit("--target com needs the OneNote desktop app and pywin32:\n"
+                         '  pip install -e ".[com]"')
+    # Early binding (makepy) is required: the API returns values through
+    # out-parameters, which late-bound Dispatch can't handle. Generate the
+    # wrapper from the type library first; EnsureDispatch(progid) needs the
+    # running app to describe itself, which fails on some installs.
+    app, last = None, None
+    try:
+        module = win32com.client.gencache.EnsureModule(*ONENOTE_TYPELIB)
+        if module is not None:
+            app = module.Application()
+    except Exception as e:  # pywintypes.com_error
+        last = e
     for progid in ("OneNote.Application", "OneNote.Application.15"):
+        if app is not None:
+            break
         try:
-            # Early binding (makepy) is required: the API returns values through
-            # out-parameters, which late-bound Dispatch can't handle.
-            return win32com.client.gencache.EnsureDispatch(progid)
+            app = win32com.client.gencache.EnsureDispatch(progid)
         except Exception as e:  # pywintypes.com_error, AttributeError from a stale cache
             last = e
-    raise SystemExit(f"Could not start OneNote through COM ({last}). Make sure the OneNote "
-                     "desktop app (Microsoft 365 / OneNote 2016) is installed and has been "
-                     "opened once. If this persists, delete the folder "
-                     "%LOCALAPPDATA%\\Temp\\gen_py and try again.")
+    if app is None:
+        raise SystemExit(f"Could not start OneNote through COM ({last}). Make sure the OneNote "
+                         "desktop app (Microsoft 365 / OneNote 2016) is installed and has been "
+                         "opened once. If this persists, delete the folder "
+                         "%LOCALAPPDATA%\\Temp\\gen_py and try again.")
+    try:  # the first real call surfaces broken registrations (see _libnotregistered_help)
+        app.GetHierarchy("", HS_NOTEBOOKS)
+    except pywintypes.com_error as e:
+        if e.hresult == TYPE_E_LIBNOTREGISTERED:
+            raise SystemExit(_libnotregistered_help()) from e
+        raise SystemExit(f"OneNote started but did not respond to COM calls ({e}).") from e
+    return app
+
+
+def _libnotregistered_help() -> str:
+    guid, _, major, minor = ONENOTE_TYPELIB
+    base = f"HKCU:\\Software\\Classes\\TypeLib\\{guid}"
+    exe = r"C:\Program Files\Microsoft Office\Root\Office16\ONENOTE.EXE\3"
+    try:
+        import winreg
+
+        key = f"TypeLib\\{guid}\\{major}.{minor}\\0\\win32"
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key) as k:
+            exe = winreg.QueryValue(k, None) or exe
+    except OSError:
+        pass
+    # Click-to-Run Office registers the library as version 1.1 for Win32 only and
+    # leaves an empty 1.0 key that OneNote itself looks up. Point both at the file.
+    entries = [f"{major}.{minor}\\0\\win64", "1.0\\0\\win64", "1.0\\0\\win32"]
+    fix = "\n".join(f"  New-Item -Force '{base}\\{e}' -Value '{exe}'" for e in entries)
+    return (
+        "OneNote's COM type library registration is incomplete, so OneNote can't answer "
+        "automation calls (\"Library not registered\"). This is a known problem with "
+        "Click-to-Run Office installs. To fix it for your Windows account only (no admin "
+        "rights needed), run this in PowerShell, then fully restart OneNote:\n\n"
+        f"{fix}\n\n"
+        "To undo it later:\n\n"
+        f"  Remove-Item '{base}\\{major}.{minor}\\0\\win64'\n"
+        f"  Remove-Item -Recurse '{base}\\1.0'")
 
 
 def _str(value) -> str:
@@ -391,6 +443,21 @@ def _str(value) -> str:
     if isinstance(value, tuple):
         return next((v for v in value if isinstance(v, str) and v), "")
     return value or ""
+
+
+def _any_time():
+    """OLE date 0 (1899-12-30), which tells OneNote not to check a page's last-modified time.
+
+    makepy generates a plain tuple as the default for these DATE parameters,
+    which current pywin32 rejects, so the value has to be passed explicitly. It
+    must be timezone-aware: a naive pre-1970 datetime fails local-time
+    conversion on Windows (OSError 22).
+    """
+    try:
+        import pywintypes
+    except ImportError:  # only the test doubles run without pywin32
+        return None
+    return pywintypes.Time(datetime(1899, 12, 30, tzinfo=timezone.utc))
 
 
 class OneNoteCom:
@@ -411,23 +478,15 @@ class OneNoteCom:
         return [{"id": nb.get("ID"), "name": nb.get("nickname") or nb.get("name"),
                  "path": nb.get("path")} for nb in root.iter(f"{_ONE}Notebook")]
 
-    def default_notebook_folder(self) -> str:
-        try:
-            folder = _str(self.app.GetSpecialLocation(SL_DEFAULT_NOTEBOOK_FOLDER))
-            if folder:
-                return folder
-        except Exception:
-            pass
-        return str(Path.home() / "Documents" / "OneNote Notebooks")
+    def find_notebook(self, name: str) -> dict | None:
+        """An open notebook by its display name (case-insensitive).
 
-    def ensure_notebook(self, name: str, folder: str | None = None) -> tuple[dict, bool]:
-        """Returns (notebook, created)."""
-        for nb in self.notebooks():
-            if (nb["name"] or "").lower() == name.lower():
-                return nb, False
-        path = os.path.join(folder or self.default_notebook_folder(), name)
-        nb_id = self._open(path, "", CFT_NOTEBOOK)
-        return {"id": nb_id, "name": name, "path": path}, True
+        Notebooks are never created here: COM can only create them from a folder,
+        which OneNote then treats as local files. Notebooks made in OneNote with
+        File > New > OneDrive are synced by OneNote itself.
+        """
+        name = name.strip().lower()
+        return next((nb for nb in self.notebooks() if (nb["name"] or "").lower() == name), None)
 
     def ensure_section(self, notebook_id: str, name: str) -> dict:
         root = self._hierarchy(notebook_id, HS_SECTIONS)
@@ -439,10 +498,10 @@ class OneNoteCom:
     def create_page(self, section_id: str, build_xml: Callable[[str], str]) -> str:
         page_id = _str(self.app.CreateNewPage(section_id))
         try:
-            self.app.UpdatePageContent(build_xml(page_id))
+            self.app.UpdatePageContent(build_xml(page_id), _any_time())
         except Exception:
             try:  # don't leave an empty "Untitled page" behind
-                self.app.DeleteHierarchy(page_id)
+                self.app.DeleteHierarchy(page_id, _any_time())
             except Exception:
                 pass
             raise

@@ -5,6 +5,7 @@ import pytest
 from enex2onenote import cli, onenote_com
 from enex2onenote.enex import Note, iter_notes
 from enex2onenote.onenote_com import NS, OneNoteCom, build_page_xml, image_size
+from enex2onenote.state import state_dir_for
 
 ONE = f"{{{NS}}}"
 
@@ -91,8 +92,11 @@ class FakeOneNote:
     """Mimics the parts of OneNote.Application that the tool calls."""
 
     def __init__(self):
-        self.notebooks = {"{nb-1}": ("Existing", "C:\\Notebooks\\Existing", {})}
+        base = "https://d.docs.live.net/0123456789ABCDEF/Documents"
+        self.notebooks = {"{nb-1}": ("Existing", f"{base}/Existing/", {}),
+                          "{nb-2}": ("Family", f"{base}/Family/", {})}
         self.pages = {}
+        self.page_sections = {}
         self.fail_next_update = False
 
     def GetHierarchy(self, start, scope):
@@ -105,31 +109,26 @@ class FakeOneNote:
         return f'<one:Notebook xmlns:one="{NS}" name="{name}" ID="{start}">{inner}</one:Notebook>'
 
     def OpenHierarchy(self, path, relative_to, cftIfNotExist=0):
-        if cftIfNotExist == onenote_com.CFT_NOTEBOOK:
-            nb_id = f"{{nb-{len(self.notebooks) + 1}}}"
-            self.notebooks[nb_id] = (path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1], path, {})
-            return nb_id
+        assert cftIfNotExist == onenote_com.CFT_SECTION, "the tool must never create notebooks"
         sections = self.notebooks[relative_to][2]
-        sec_id = f"{{sec-{len(sections) + 1}}}"
+        sec_id = f"{{{relative_to}-sec-{len(sections) + 1}}}"  # unique across notebooks
         sections[sec_id] = path[:-4]
         return sec_id
-
-    def GetSpecialLocation(self, loc):
-        return "C:\\Notebooks"
 
     def CreateNewPage(self, section_id):
         page_id = f"{{page-{len(self.pages) + 1}}}"
         self.pages[page_id] = None
+        self.page_sections[page_id] = section_id
         return page_id
 
-    def UpdatePageContent(self, xml):
+    def UpdatePageContent(self, xml, date_expected_last_modified):
         if self.fail_next_update:
             self.fail_next_update = False
             raise RuntimeError("0x80042001 invalid XML")
         page_id = ET.fromstring(xml).get("ID")
         self.pages[page_id] = xml
 
-    def DeleteHierarchy(self, object_id):
+    def DeleteHierarchy(self, object_id, date_expected_last_modified):
         del self.pages[object_id]
 
     def GetHyperlinkToObject(self, object_id, content_id):
@@ -139,12 +138,10 @@ class FakeOneNote:
 def test_com_hierarchy_helpers():
     app = FakeOneNote()
     com = OneNoteCom(app)
-    nb, created = com.ensure_notebook("existing")
-    assert nb["id"] == "{nb-1}" and not created
-    nb2, created = com.ensure_notebook("New One")
-    assert created and nb2["path"].endswith("New One")
-    sec = com.ensure_section(nb2["id"], "Bills")
-    assert com.ensure_section(nb2["id"], "bills")["id"] == sec["id"]
+    assert com.find_notebook(" existing ")["id"] == "{nb-1}"
+    assert com.find_notebook("New One") is None
+    sec = com.ensure_section("{nb-2}", "Bills")
+    assert com.ensure_section("{nb-2}", "bills")["id"] == sec["id"]
 
     app.fail_next_update = True
     with pytest.raises(RuntimeError):
@@ -162,7 +159,7 @@ def test_cli_upload_via_com(sample_enex, tmp_path, monkeypatch, capsys):
     cli.main(base + ["analyze", str(sample_enex)])
 
     cli.main(base + ["upload", str(sample_enex), "--target", "com", "--dry-run"])
-    previews = sorted((tmp_path / "state" / "Household Bills" / "preview").glob("*.xml"))
+    previews = sorted((state_dir_for(tmp_path / "state", sample_enex) / "preview").glob("*.xml"))
     assert len(previews) == 2
 
     cli.main(base + ["upload", str(sample_enex), "--target", "com", "--notebook", "Existing"])
@@ -176,3 +173,231 @@ def test_cli_upload_via_com(sample_enex, tmp_path, monkeypatch, capsys):
     # Re-running uploads nothing new.
     cli.main(base + ["upload", str(sample_enex), "--target", "com", "--notebook", "Existing"])
     assert "Uploaded 0" in capsys.readouterr().out and len(app.pages) == 2
+
+
+@pytest.mark.parametrize("section, expected", [
+    (None, {"Household Bills": 2, "Recipes": 2}),  # default: one section per export
+    ("Everything", {"Everything": 4}),
+])
+def test_merge_exports_into_one_notebook(sample_enex, second_enex, tmp_path, monkeypatch,
+                                         capsys, section, expected):
+    from test_pipeline import FakeAnalyzer
+
+    app = FakeOneNote()
+    monkeypatch.setattr(onenote_com, "_dispatch", lambda: app)
+    monkeypatch.setattr(cli, "make_analyzer", lambda *a, **k: FakeAnalyzer())
+    base = ["--state-dir", str(tmp_path / "state")]
+    target = ["--target", "com", "--notebook", "Family"] + (["--section", section] if section else [])
+    for enex in (sample_enex, second_enex):
+        cli.main(base + ["analyze", str(enex)])
+        cli.main(base + ["upload", str(enex)] + target)
+
+    sections = app.notebooks["{nb-2}"][2]
+    counts = {name: sum(1 for s in app.page_sections.values() if s == sid)
+              for sid, name in sections.items()}
+    assert counts == expected
+    assert len(app.notebooks) == 2
+
+
+@pytest.mark.parametrize("command", ["upload", "migrate"])
+def test_missing_notebook_is_not_created(sample_enex, tmp_path, monkeypatch, command):
+    from test_pipeline import FakeAnalyzer
+
+    app = FakeOneNote()
+    monkeypatch.setattr(onenote_com, "_dispatch", lambda: app)
+    analyzer = FakeAnalyzer()
+    monkeypatch.setattr(cli, "make_analyzer", lambda *a, **k: analyzer)
+    base = ["--state-dir", str(tmp_path / "state")]
+    with pytest.raises(SystemExit) as exc:
+        cli.main(base + [command, str(sample_enex), "--notebook", "Finances"])
+    msg = str(exc.value)
+    assert "no open notebook named:\n  Finances\n" in msg and "File > New > OneDrive" in msg
+    assert "  Existing\n  Family" in msg  # lists what is open
+    assert len(app.notebooks) == 2 and not app.pages
+    assert analyzer.seen_vocab is None  # migrate stops before analyzing anything
+
+
+def test_dispatch_explains_32_bit_only_type_library(monkeypatch):
+    """Click-to-Run Office can leave OneNote's type library without a win64 entry."""
+    import sys
+    import types
+
+    class ComError(Exception):
+        def __init__(self, hresult, msg):
+            super().__init__(hresult, msg)
+            self.hresult = hresult
+
+    class App:
+        def GetHierarchy(self, start, scope):
+            raise ComError(onenote_com.TYPE_E_LIBNOTREGISTERED, "Library not registered.")
+
+    gencache = types.SimpleNamespace(
+        EnsureModule=lambda *a: types.SimpleNamespace(Application=App))
+    client = types.ModuleType("win32com.client")
+    client.gencache = gencache
+    win32com = types.ModuleType("win32com")
+    win32com.client = client
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setitem(sys.modules, "pywintypes", types.SimpleNamespace(com_error=ComError))
+
+    with pytest.raises(SystemExit) as exc:
+        onenote_com._dispatch()
+    msg = str(exc.value)
+    assert "Library not registered" in msg
+    for entry in (r"\1.1\0\win64", r"\1.0\0\win64", r"\1.0\0\win32"):
+        assert f"{entry}' -Value '" in msg
+    assert "Remove-Item -Recurse" in msg
+
+
+def test_com_is_the_default_target():
+    parser = cli.build_parser()
+    for argv in (["upload", "x.enex"], ["migrate", "x.enex"], ["notebooks"]):
+        assert parser.parse_args(argv).target == "com"
+
+
+def test_migrate_checks_onenote_before_analyzing(sample_enex, tmp_path, monkeypatch):
+    def no_onenote():
+        raise SystemExit("Could not start OneNote through COM")
+
+    def must_not_analyze(*a, **k):
+        raise AssertionError("analysis started before OneNote was checked")
+
+    monkeypatch.setattr(onenote_com, "_dispatch", no_onenote)
+    monkeypatch.setattr(cli, "make_analyzer", must_not_analyze)
+    with pytest.raises(SystemExit, match="Could not start OneNote"):
+        cli.main(["--state-dir", str(tmp_path / "state"), "migrate", str(sample_enex)])
+
+
+def test_same_file_name_in_two_notebook_folders(tmp_path, monkeypatch):
+    """Finances/Receipts.enex and Family/Receipts.enex keep separate progress."""
+    import csv
+
+    from conftest import note_xml, write_enex
+    from test_pipeline import FakeAnalyzer
+
+    shared = note_xml("Scan_0001.pdf", "<p>Same note exported from both notebooks</p>")
+    exports = {}
+    for folder, own in (("Existing", "Hardware store receipt"), ("Family", "Zoo tickets")):
+        (tmp_path / folder).mkdir()
+        exports[folder] = write_enex(tmp_path / folder / "Receipts.enex",
+                                     [shared, note_xml(own, f"<p>{own}</p>")])
+
+    app = FakeOneNote()
+    monkeypatch.setattr(onenote_com, "_dispatch", lambda: app)
+    analyzer = FakeAnalyzer()
+    monkeypatch.setattr(cli, "make_analyzer", lambda *a, **k: analyzer)
+    state = tmp_path / "state"
+    for folder, enex in exports.items():
+        cli.main(["--state-dir", str(state), "analyze", str(enex)])
+        cli.main(["--state-dir", str(state), "upload", str(enex), "--notebook", folder])
+
+    for folder, own in (("Existing", "Hardware store receipt"), ("Family", "Zoo tickets")):
+        review = state / folder / "Receipts" / "review.csv"
+        titles = [r["original_title"] for r in csv.DictReader(review.open(encoding="utf-8-sig"))]
+        assert titles == ["Scan_0001.pdf", own]
+    assert analyzer.seen_vocab == ["bills"]  # tags from the first folder reach the second
+    # The shared note is uploaded into both notebooks, not skipped the second time.
+    for nb_id in ("{nb-1}", "{nb-2}"):
+        (sec_id,) = app.notebooks[nb_id][2]
+        assert sum(1 for s in app.page_sections.values() if s == sec_id) == 2
+
+
+def make_export_folder(root):
+    """Exports/<Notebook>/<Section>.enex with notebooks Existing and Family."""
+    from conftest import note_xml, write_enex
+
+    for rel, titles in {"Existing/Receipts.enex": ["Hardware store", "Pharmacy"],
+                        "Existing/Taxes.enex": ["W-2 form"],
+                        "Family/Recipes.enex": ["Pancakes", "Apple pie", "Chili"]}.items():
+        path = root / "Exports" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_enex(path, [note_xml(t, f"<p>{t}</p>") for t in titles])
+    return root / "Exports"
+
+
+def pages_by_section(app):
+    """{(notebook, section): [page titles]} from the fake OneNote."""
+    out = {}
+    for nb_name, _, sections in app.notebooks.values():
+        for sec_id, sec_name in sections.items():
+            out[(nb_name, sec_name)] = [
+                ET.fromstring(app.pages[p]).find(f"{ONE}Title/{ONE}OE/{ONE}T").text
+                for p, s in app.page_sections.items() if s == sec_id]
+    return out
+
+
+@pytest.mark.parametrize("two_steps", [True, False])
+def test_folder_upload_maps_folders_to_notebooks(tmp_path, monkeypatch, capsys, two_steps):
+    from test_pipeline import FakeAnalyzer
+
+    exports = make_export_folder(tmp_path)
+    app = FakeOneNote()
+    monkeypatch.setattr(onenote_com, "_dispatch", lambda: app)
+    monkeypatch.setattr(cli, "make_analyzer", lambda *a, **k: FakeAnalyzer())
+    base = ["--state-dir", str(tmp_path / "state")]
+    if two_steps:
+        cli.main(base + ["analyze", str(exports)])
+        cli.main(base + ["upload", str(exports)])
+    else:
+        cli.main(base + ["migrate", str(exports)])
+
+    assert pages_by_section(app) == {
+        ("Existing", "Receipts"): ["AI Hardware store", "AI Pharmacy"],
+        ("Existing", "Taxes"): ["AI W-2 form"],
+        ("Family", "Recipes"): ["AI Pancakes", "AI Apple pie", "AI Chili"],
+    }
+    out = capsys.readouterr().out
+    assert "3 export(s) in 2 notebook(s):\n  Existing: Receipts, Taxes\n  Family: Recipes" in out
+    assert "=== Family / Recipes (3 of 3) ===" in out
+    assert "All 3 exports: " in out and "uploaded 6" in out
+    for review in ("Existing/Receipts", "Existing/Taxes", "Family/Recipes"):
+        assert (tmp_path / "state" / review / "review.csv").exists()
+
+    # Re-running the folder uploads nothing new.
+    cli.main(base + ["upload", str(exports)])
+    assert "uploaded 0" in capsys.readouterr().out and len(app.pages) == 6
+
+
+@pytest.mark.parametrize("command", ["upload", "migrate"])
+def test_folder_upload_checks_every_notebook_first(tmp_path, monkeypatch, command):
+    from conftest import note_xml, write_enex
+    from test_pipeline import FakeAnalyzer
+
+    exports = make_export_folder(tmp_path)
+    for name in ("Travel", "Finances"):
+        (exports / name).mkdir()
+        write_enex(exports / name / "Misc.enex", [note_xml("t", "<p>x</p>")])
+    app = FakeOneNote()
+    monkeypatch.setattr(onenote_com, "_dispatch", lambda: app)
+    analyzer = FakeAnalyzer()
+    monkeypatch.setattr(cli, "make_analyzer", lambda *a, **k: analyzer)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--state-dir", str(tmp_path / "state"), command, str(exports)])
+    assert "no open notebook named:\n  Finances\n  Travel\n" in str(exc.value)
+    assert not app.pages and analyzer.seen_vocab is None  # nothing uploaded or analyzed
+
+
+def test_folder_rejects_notebook_and_section_options(tmp_path):
+    exports = make_export_folder(tmp_path)
+    for opt in (["--notebook", "X"], ["--section", "Y"]):
+        with pytest.raises(SystemExit, match="apply to a single .enex file"):
+            cli.main(["--state-dir", str(tmp_path / "state"), "upload", str(exports), *opt])
+
+
+def test_folder_dry_run_needs_no_onenote(tmp_path, monkeypatch, capsys):
+    from test_pipeline import FakeAnalyzer
+
+    def no_onenote():
+        raise AssertionError("dry run must not connect to OneNote")
+
+    exports = make_export_folder(tmp_path)
+    monkeypatch.setattr(onenote_com, "_dispatch", no_onenote)
+    monkeypatch.setattr(cli, "make_analyzer", lambda *a, **k: FakeAnalyzer())
+    base = ["--state-dir", str(tmp_path / "state")]
+    cli.main(base + ["analyze", str(exports / "Family"), "--limit", "2"])  # one notebook folder
+    cli.main(base + ["upload", str(exports / "Family"), "--dry-run"])
+    previews = list((tmp_path / "state" / "Family" / "Recipes" / "preview").glob("*.xml"))
+    assert len(previews) == 2  # only the notes --limit let through were analyzed
+    out = capsys.readouterr().out
+    assert "previewed 2" in out and "not analyzed 1" in out

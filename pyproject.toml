@@ -12,6 +12,7 @@ dependencies = [
     "anthropic>=1.9",
     "beautifulsoup4>=4.12",
     "defusedxml>=0.7",
+    "fonttools>=4.40",  # lets pypdf decode CFF/Type1 font encodings when extracting PDF text
     "msal>=1.28",
     "pypdf>=4.0",
     "requests>=2.31",
@@ -30,3 +31,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["onenote: writes to the real OneNote desktop app (opt-in: ENEX2ONENOTE_LIVE_ONENOTE=1)"]

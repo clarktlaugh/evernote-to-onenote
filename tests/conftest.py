@@ -73,6 +73,15 @@ def md5(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 
+def write_enex(path, notes):
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE en-export SYSTEM "http://xml.evernote.com/pub/evernote-export4.dtd">\n'
+        f'<en-export export-date="20240101T000000Z">{"".join(notes)}</en-export>',
+        encoding="utf-8")
+    return path
+
+
 @pytest.fixture
 def sample_enex(tmp_path):
     png = make_png()
@@ -90,10 +99,14 @@ def sample_enex(tmp_path):
                   resource_xml(blank, "application/pdf", "unreferenced.pdf")]),
         note_xml("Recipe &amp; notes", "<p>Plain text note about pancakes.</p>"),
     ]
-    path = tmp_path / "Household Bills.enex"
-    path.write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE en-export SYSTEM "http://xml.evernote.com/pub/evernote-export4.dtd">\n'
-        f'<en-export export-date="20240101T000000Z">{"".join(notes)}</en-export>',
-        encoding="utf-8")
-    return path
+    return write_enex(tmp_path / "Household Bills.enex", notes)
+
+
+@pytest.fixture
+def second_enex(tmp_path):
+    """A second export, for merging several .enex files into one notebook."""
+    return write_enex(tmp_path / "Recipes.enex", [
+        note_xml("IMG_2231", "<p>Buttermilk pancakes: flour, buttermilk, eggs.</p>",
+                 created="20190502T080000Z"),
+        note_xml("Note", "<p>Grandma Ruth's apple pie.</p>", created="20180101T120000Z"),
+    ])

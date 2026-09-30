@@ -8,6 +8,7 @@ from enex2onenote import ai, cli
 from enex2onenote.content import extract_for_analysis, note_text
 from enex2onenote.enex import Resource, count_notes, iter_notes
 from enex2onenote.onenote import MAX_DATA_PARTS, plan_page
+from enex2onenote.state import state_dir_for
 
 
 def test_parse_enex(sample_enex):
@@ -118,7 +119,8 @@ def test_analyze_review_and_dry_run(sample_enex, tmp_path, monkeypatch, capsys):
     base = ["--state-dir", str(state_dir)]
 
     cli.main(base + ["analyze", str(sample_enex), "--workers", "2"])
-    review_path = state_dir / "Household Bills" / "review.csv"
+    review_path = state_dir_for(state_dir, sample_enex) / "review.csv"
+    assert review_path.parent == state_dir / sample_enex.parent.name / "Household Bills"
     rows = list(csv.DictReader(review_path.open(encoding="utf-8-sig")))
     assert [r["final_title"] for r in rows] == ["AI Scan_0012.pdf", "", "AI Recipe & notes"]
     assert rows[1]["ai_title"].startswith("ERROR")
@@ -139,8 +141,8 @@ def test_analyze_review_and_dry_run(sample_enex, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Analyzed 1 note(s), 1 failed" in out
 
-    cli.main(base + ["upload", str(sample_enex), "--dry-run"])
-    previews = sorted((state_dir / "Household Bills" / "preview").glob("*.html"))
+    cli.main(base + ["upload", str(sample_enex), "--dry-run", "--target", "graph"])
+    previews = sorted((review_path.parent / "preview").glob("*.html"))
     assert len(previews) == 1
     assert "<title>My edited title</title>" in previews[0].read_text()
     out = capsys.readouterr().out
@@ -152,7 +154,7 @@ def test_analyze_review_and_dry_run(sample_enex, tmp_path, monkeypatch, capsys):
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
         w.writeheader()
         w.writerows(rows)
-    cli.main(base + ["upload", str(sample_enex), "--dry-run"])
+    cli.main(base + ["upload", str(sample_enex), "--dry-run", "--target", "graph"])
     assert "Previewed 2, skipped 1" in capsys.readouterr().out
 
 
@@ -177,3 +179,78 @@ def test_claude_code_analyzer_parses_output(sample_enex, monkeypatch):
     assert result.title == "Comcast bill - March 2021" and result.model == "claude-sonnet-5-5"
     assert "--json-schema" in calls["cmd"] and calls["cmd"][calls["cmd"].index("--tools") + 1] == ""
     assert "Comcast invoice" in calls["input"]
+
+
+def test_graph_skips_past_every_full_section(sample_enex, monkeypatch, capsys):
+    """A second export merged into a full section must not stop at a full "(2)"."""
+    import argparse
+
+    from enex2onenote import onenote
+
+    full = {"sec-Bills", "sec-Bills (2)"}
+
+    class FakeGraph:
+        def ensure_section(self, notebook_id, name):
+            return {"id": f"sec-{name}", "displayName": name}
+
+    def fake_upload_page(graph, section_id, plan, folder):
+        if section_id in full:
+            raise onenote.GraphError(507, "section is full")
+        return {"id": f"page-in-{section_id}"}
+
+    monkeypatch.setattr(onenote, "upload_page", fake_upload_page)
+    args = argparse.Namespace(notebook="Family", no_pdf_printouts=False, no_summary=False)
+    up = cli.GraphUploader(args, "Bills")
+    up.graph, up.notebook_id = FakeGraph(), "nb"
+    up.section = up.graph.ensure_section("nb", "Bills")
+    info = up.upload(next(iter_notes(sample_enex)), "t", [], "")
+    assert info["page_id"] == "page-in-sec-Bills (3)" and info["section"] == "Bills (3)"
+
+
+def test_state_dir_refuses_a_second_export_with_the_same_key(tmp_path):
+    """Same-named folders in different places would map to the same directory."""
+    from conftest import note_xml, write_enex
+
+    from enex2onenote.state import NotebookState
+
+    first, second = (tmp_path / p / "Finances" for p in ("A", "B"))
+    for d in (first, second):
+        d.mkdir(parents=True)
+        write_enex(d / "Receipts.enex", [note_xml("t", "<p>x</p>")])
+    state = tmp_path / "state"
+    NotebookState(state, first / "Receipts.enex")
+    NotebookState(state, first / "Receipts.enex")  # the same export again is fine
+    with pytest.raises(SystemExit, match="already holds the progress for"):
+        NotebookState(state, second / "Receipts.enex")
+
+    # A moved export takes its progress along: the old path no longer exists.
+    moved = tmp_path / "C" / "Finances"
+    moved.parent.mkdir()
+    first.rename(moved)
+    assert NotebookState(state, moved / "Receipts.enex").dir == state / "Finances" / "Receipts"
+
+
+def test_claude_code_pipe_is_utf8(tmp_path, monkeypatch):
+    """On Windows, text pipes default to cp1252, which can't carry U+2011 and garbles replies."""
+    import subprocess
+
+    from conftest import note_xml, write_enex
+
+    enex = write_enex(tmp_path / "x.enex", [note_xml("Keypad", "<p>Code 1234‑5678 – café</p>")])
+    reply = {"type": "result", "subtype": "success", "is_error": False, "result": "",
+             "structured_output": {"title": "Keypad code – café", "tags": ["auto"],
+                                   "summary": "Staffing 2–6 months.",
+                                   "original_title_ok": False, "confidence": "high"}}
+
+    def pipe_like_windows(cmd, input, encoding=None, errors="strict", **kw):
+        encoding = encoding or "cp1252"  # what text=True picks on a US-English Windows
+        received = input.encode(encoding, errors).decode("utf-8")  # claude reads UTF-8
+        assert "1234‑5678" in received
+        stdout = json.dumps(reply, ensure_ascii=False).encode("utf-8").decode(encoding, errors)
+        return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+    monkeypatch.setattr(ai.shutil, "which", lambda _: "claude")
+    monkeypatch.setattr(ai.subprocess, "run", pipe_like_windows)
+    result = ai.ClaudeCodeAnalyzer(None).analyze(next(iter_notes(enex)), [])
+    assert result.title == "Keypad code – café"
+    assert result.summary == "Staffing 2–6 months."

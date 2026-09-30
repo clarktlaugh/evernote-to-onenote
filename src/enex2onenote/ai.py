@@ -267,7 +267,11 @@ class ClaudeCodeAnalyzer(Analyzer):
             if self.effort:
                 cmd += ["--effort", self.effort]
             try:
+                # claude reads and writes UTF-8. Without an explicit encoding, Windows
+                # would use its ANSI code page (cp1252) and fail on characters like
+                # U+2011, or garble Claude's reply.
                 proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace",
                                       cwd=tmp, timeout=self.timeout, env=os.environ.copy())
             except subprocess.TimeoutExpired as e:
                 raise AnalysisError("claude timed out") from e
